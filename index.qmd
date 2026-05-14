@@ -1,0 +1,201 @@
+```{r}
+library(sf)
+library(tidyverse)
+library(tidymodels)
+library(tmap)
+library(zoo)
+library(important)
+
+
+
+```
+
+### Own attempt
+
+With the above example at hand, it is now my goal to build a predictor that produces a classifier on the per point basis. For this I will additionally rely on utilities of the `tidymodels` package
+
+### Loading Data
+
+For loading the data, the code from the example can be reused
+
+```{r}
+training_dataset <- read_sf("data/tracks_1.gpkg", layer = "training") %>%
+  mutate(data = "training")
+testing_dataset <- read_sf("data/tracks_1.gpkg", layer = "testing") %>%
+  mutate(data = "testing")
+validation_dataset <- read_sf("data/tracks_1.gpkg", layer = "validation") %>%
+  mutate(data = "validation")
+
+
+full_dataset <- bind_rows(training_dataset, testing_dataset, validation_dataset)
+
+
+
+```
+
+
+### Feature Engineering
+
+For feature engineering I will also include the velocity and the acceleration and sinuosity. I thought about the problem for a while and I could not come up with a beneficial new feature. So I will try to extend and improve the pipeline by focusing on modelselection and hyperparametertuning.
+
+```{r}
+
+full_dataset_feautre_eng <- full_dataset %>%
+  group_by(track_id) %>%
+  mutate(
+    steplength = as.numeric(st_distance(lead(geom), geom, by_element = TRUE)),
+    timelag = as.numeric(difftime(lead(datetime), datetime, units = "secs")),
+    speed = steplength / timelag,
+    acceleration = lead(speed) - speed / timelag,
+    straight_dist5 = as.numeric(st_distance(lead(geom, 5), geom, by_element = TRUE)),
+    full_dist5 = rollsum(steplength, 5, fill = NA, align = "left", ),
+    sinuosity = full_dist5/straight_dist5,
+  ) %>%
+  ungroup()
+
+full_dataset_feautre_eng %>% pull(speed) %>% is.infinite() %>% any()
+
+
+```
+
+
+## No Free Lunch Theorem - Choosing a model
+
+In ML there is a important theorem that essentialy states, that there is no "best algorithm". Different algorithms perform differently for different feature spaces and there is no "one beats all model". Therefore it is important to test out different algoritms since it is not clear which one will perform best. This should in theory be done very explicitly, by also varying all the hyperparameter for every different algorithms. But like often in data science, there is a tention between computational resources and performance. Running hyperparameter tuning via a grid search combined with a cross validation is just to expensive in terms of execution time. So I am deploing a very greedy search here where I just run all the different models with their standart parameters and perform a 5-fold cross validation. This is a gready search as it will pick a good algorithm but not necessairly the best suited algorithm. KNN could for instance be much higher performing than random forest but it was just not discovered during the gready search as the standart hyperparameters of KNN are less suited than the standart hyperparameter of the random forest. (But very analogous to live, often a good solution is allready sufficient for the use case).
+
+
+
+```{r}
+
+data_split <- full_dataset_feautre_eng %>% 
+  sf::st_drop_geometry() %>%
+  mutate(across(where(is.numeric), ~if_else(is.infinite(.), NA_real_, .))) %>%
+  drop_na() %>%
+  initial_split(., prop = 0.75, strata = mode)
+
+production_set <- data_split %>% training()
+
+testing_set <- data_split %>% testing()
+
+
+```
+
+### Preparing recepie
+
+In `tidymodels` a recepie can be defined that is performing the preproccessing. This recepie has the advantage, that it integrates into cross validation frameworkes. In a cross validation the complete preprocessing recepie is executed on the training folds, the model is trained on the training fold and lastly tested on the hold out fold. This is great as some preprocessing steps such as feature elimination based on correlation coefficients leak information into the testset otherwise. So the architecture of `tidymodels` forces a user to follow the goldstandart (which is neat I think).
+
+
+The defined recepie is doing the following:
+
+1. Droping predictors that suffer from multicolinearity with other predictors
+2. scaling the remaining predictors into [0,1] range (as some models perform poorly in non scaled spaces)
+
+```{r}
+
+rec <- production_set %>%
+  select(!c(user_id, track_id, datetime, alt, data)) %>%
+  recipe(mode ~ ., .) %>%
+    step_corr(all_numeric_predictors(), threshold = 0.75) %>%
+    step_range(all_numeric_predictors(), min = 0, max = 1)
+  # a lot of models handle normalized vector spaces [0,1] better
+
+```
+
+
+
+### Defining models
+
+`tidymodels` also features a uniform interface of a range of ML packages, that are implemented in R. With `set_engine` one can choose from which package the underlying algorithm should be adopted.
+
+Then I am defining a `workflow set`. Here the classifiers get combined with the data processing recepie to `workflows`. Each of these workflows are then beeing executed in a `5-fold` cross validatio to get robust performance metrics. The model that yields the best score, I will then pick.
+
+```{r}
+
+# extrem gradient bossted trees
+xgb_model <- boost_tree(trees = 500) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost")
+
+
+# good old logistic regression
+logistic_model <- multinom_reg(penalty = 0.01) %>%
+  set_mode("classification") %>% # set model to classifier
+  set_engine("glmnet")
+
+
+# a decission tree
+dt_model <- decision_tree() %>%
+    set_mode("classification") %>% # set model to classifier
+    set_engine("rpart")
+
+
+# combine into a workflow set
+wf_set <- workflow_set(
+  preproc = list(rec = rec),
+  models  = list(logistic = logistic_model,dt = dt_model, xgb = xgb_model)
+)
+
+
+# tune all of them
+results <- wf_set %>%
+  workflow_map(
+    fn = "fit_resamples",
+    resamples = vfold_cv(production_set, v = 5),
+    verbose = TRUE 
+  )
+
+
+rank_results(results, rank_metric = "accuracy")
+
+```
+
+Gradient Boosting has outclassed the others by a reasonable margin. So we gotta go with gradient boosted trees.
+
+### Continuing with xgboost
+
+Next I will perform hyperparameter tuning for the xgboost algorithm aswell as for the recepie step. Namely, which threshold for multicolinearity to use is rather arbitrary and generally it is best to determine this empirically to. For hyperparameter tuning I will also deploy a nested cross validation. Hyperparameter tuning in the inner loop and crossvalidation in the outer loop. As a method for hyperparameter search I am using `bayesian optimisation`.
+
+
+```{r}
+
+rec <- production_set %>%
+  select(!c(user_id, track_id, datetime, alt, data)) %>%
+  recipe(mode ~ ., .) %>%
+  step_corr(all_numeric_predictors(), threshold = tune()) %>%
+  step_range(all_numeric_predictors(), min = 0, max = 1)
+
+xgb_model <- boost_tree(
+  trees = tune(),
+  learn_rate = tune(),
+  tree_depth = tune(),
+  min_n = tune()
+) %>%
+  set_mode("classification")
+
+
+wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(xgb_model)
+
+
+results <- wf %>%
+  tune_grid(
+    resamples = vfold_cv(production_set, v = 5),
+    grid = 10,
+    verbose = TRUE 
+  )
+
+```
+
+
+
+### Refining the Feature Space
+
+Enironmental infromation can be used for further feature engineering. 
+
+```{r}
+gpkg <- "data/movement-II/osm.gpkg"
+
+st_layers(gpkg)
+
+```
